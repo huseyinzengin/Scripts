@@ -1,0 +1,181 @@
+Bu doküman, Microsoft Graph API ve PowerShell kullanılarak Microsoft 365 kullanıcılarının User Principal Name (UPN) değerlerinin belirli bir kuruma ait alan adına göre otomatik güncellenmesini sağlayan süreci açıklamaktadır.
+
+1️⃣ PowerShell Gereksinimleri
+İşlem yapılacak makinede aşağıdaki PowerShell modülünün kurulu olması gerekir:
+
+Microsoft.Graph PowerShell SDK Yüklemesi
+Install-Module Microsoft.Graph -Scope CurrentUser
+
+⚠️ Not: Makinede eski Microsoft Graph modülleri varsa kaldırılmalı ya da -Force parametresi kullanılmalıdır.
+
+
+
+2️⃣ Azure App Registration İşlemi
+
+Microsoft Graph API ile PowerShell üzerinden işlem yapabilmek için Azure AD'de bir uygulama kaydı yapılmalı ve uygun izinler verilmelidir.
+
+📌 Adımlar:
+Azure portalına giriş yapın: https://portal.azure.com
+
+Azure Active Directory > App registrations > New registration adımlarını izleyin.
+
+Bir uygulama adı verin (örneğin: OZU-ChangeUPNScript) ve Single tenant olarak bırakın.
+
+Uygulama oluşturulduktan sonra:
+
+Application (client) ID bilgisini not edin
+
+Directory (tenant) ID: bilgisini not edin
+
+Client Secret bilgilerini not edin.
+
+API permissions > Add a permission > Microsoft Graph > Application permissions bölümünden aşağıdaki izinleri ekleyin:
+
+User.Read.All
+User.ReadWrite.All
+
+İzinleri ekledikten sonra "Grant admin consent" işlemini gerçekleştirin.
+
+3️⃣ PowerShell Script'in Yapısı
+Script aşağıdaki işlemleri gerçekleştirmektedir:
+
+Kurum alan adıyla biten UPN'leri filtreler.  (universityname.onmicrosoft.com)
+
+Kullanıcının ProxyAddresses değerinde uygun SMTP adresi varsa, bu adresi yeni UPN olarak belirler.
+
+exceptionList içinde olan kullanıcılar işlem dışında bırakılır.
+
+UPN değişikliği gerekiyorsa Update-MgUser ile güncelleme yapılır.
+
+Güncelleme öncesi ve sonrası CSV kayıtları alınır. (C:\scripts\output altına yedeklenir)
+
+Eğer en az bir kullanıcı güncellendiyse, HTML formatında özet içeren bir e-posta gönderilir.
+
+💻 Script’in Tamamı
+# Bağlantı için gerekli kimlik bilgileri
+$TenantId = "daha önce not ettiğimiz bilgiyi ekleyin"
+$ClientId = "daha önce not ettiğimiz bilgiyi ekleyin"
+$ClientSecret = "daha önce not ettiğimiz bilgiyi ekleyin"
+$SecureClientSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+$Cred = New-Object System.Management.Automation.PSCredential($ClientId, $SecureClientSecret)
+
+Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $Cred
+
+# Klasör ve dosya isimleri
+$OutputFolder = "C:\scripts\output\"
+$CurrentDate = Get-Date -Format 'yyyy-MM-dd_HH-mm'
+$BeforeCsv = "$OutputFolder\Users_BeforeUpdate_$CurrentDate.csv"
+$AfterCsv  = "$OutputFolder\Users_AfterUpdate_$CurrentDate.csv"
+
+# Eski CSV'leri temizle
+Get-ChildItem -Path $OutputFolder -Filter "*.csv" | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-15) } | Remove-Item -Force
+
+# İstisna kullanıcılar (küçük harfle yazılmalı)
+$exceptionList = @(
+    "azureadmin@universityname.onmicrosoft.com",
+    "other.user@universityname.onmicrosoft.com"
+)
+
+# Kullanıcıları getir
+$users = Get-MgUser -All -Property "DisplayName,UserPrincipalName,Id,ProxyAddresses,Mail"
+
+# Yerel filtreleme
+$filteredUsers = $users | Where-Object { $_.UserPrincipalName -like "*@universityname.onmicrosoft.com" }
+
+# Öncesi CSV
+$filteredUsers | Select-Object DisplayName, UserPrincipalName, Mail, Id, @{Name="ProxyAddresses";Expression={($_.ProxyAddresses -join ";")}} | Export-Csv -Path $BeforeCsv -NoTypeInformation
+
+# HTML tablo başlat
+$htmlTable = @"
+<style>
+table { border-collapse: collapse; width: 100%; font-family: Arial; }
+th, td { border: 1px solid #ccc; padding: 8px; }
+th { background-color: #f2f2f2; }
+</style>
+<h2>UPN Güncelleme Raporu - $CurrentDate</h2>
+<table>
+<tr>
+    <th>Display Name</th>
+    <th>Eski UPN</th>
+    <th>Yeni UPN</th>
+    <th>Durum</th>
+</tr>
+"@
+
+# Güncelleme yapılmış kullanıcı sayısı
+$updateCount = 0
+
+foreach ($user in $filteredUsers) {
+    $upn = $user.UserPrincipalName.ToLower()
+    if ($exceptionList -contains $upn -or $upn -like "*#ext#@*") {
+        continue
+    }
+
+    $newUPN = $user.ProxyAddresses |
+        Where-Object { $_ -match "^smtp:.*@(universityname\.edu\.tr|otherdomain\.edu\.tr)$" } |
+        ForEach-Object { $_.ToLower().Replace("smtp:", "") } |
+        Select-Object -First 1
+
+    if (-not $newUPN) {
+        $status = "❓ Proxy uygun değil"
+    }
+    elseif ($newUPN -ne $upn) {
+        try {
+            Update-MgUser -UserId $user.Id -UserPrincipalName $newUPN -ErrorAction Stop
+            $status = "🔄 Güncellendi"
+            $updateCount++
+        } catch {
+            $status = "❌ HATA: $_"
+        }
+    } else {
+        $status = "✅ Zaten uygun"
+    }
+
+    $htmlTable += "<tr><td>$($user.DisplayName)</td><td>$upn</td><td>$newUPN</td><td>$status</td></tr>"
+}
+
+$htmlTable += "</table>"
+
+# Sonrası CSV
+$filteredUsers = Get-MgUser -All -Property "DisplayName,UserPrincipalName,Id,ProxyAddresses,Mail"
+$filteredUsers | Select-Object DisplayName, UserPrincipalName, Mail, Id, @{Name="ProxyAddresses";Expression={($_.ProxyAddresses -join ";")}} | Export-Csv -Path $AfterCsv -NoTypeInformation
+
+# E-posta gönderimi (sadece güncelleme yapılmışsa)
+if ($updateCount -gt 0) {
+    $To = 'sysadmins@universityname.edu.tr'
+    $From = 'automation@universityname.edu.tr'
+    $Subject = "UPN Güncellemeleri: $CurrentDate"
+    $SmtpServer = "10.100.10.10"
+    $Port = 25
+
+    Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlTable -SmtpServer $SmtpServer -Port $Port -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8)
+} else {
+    Write-Host "Güncelleme yapılmadı, e-posta gönderilmeyecek."
+}
+
+4️⃣ Kullanım Notları
+
+Script otomatik olarak sadece @universityname.onmicrosoft.com uzantılı UPN’leri kontrol eder.
+
+ProxyAddresses alanı içinde smtp:xxx@university.edu.tr ya da smtp:xxx@universite.edu.tr adresi varsa, bu adres yeni UPN olarak atanır.
+
+E-posta gönderimi, sadece en az bir kullanıcı güncellendiyse yapılır.
+
+15 günden eski CSV dosyaları otomatik silinir.
+
+Script zamanlanmış görev (Task Scheduler) ile periyodik çalıştırılabilir.
+
+📎 Örnek Çıktılar
+CSV Dosyaları:
+
+Users_BeforeUpdate_yyyy-MM-dd_HH-mm.csv
+
+Users_AfterUpdate_yyyy-MM-dd_HH-mm.csv
+
+E-posta içeriği: Güncellenen kullanıcıları listeleyen HTML tablo.
+
+🧪 Test ve Doğrulama
+Script test ortamında -WhatIf parametresiyle çalıştırılarak hiçbir kullanıcıya müdahale etmeden çıktılar kontrol edilebilir.
+
+İlk kullanım öncesi e-posta gönderimi için SMTP sunucusunun erişilebilir olduğundan emin olun.
+
